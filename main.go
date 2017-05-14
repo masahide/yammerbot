@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/k0kubun/pp"
 	"github.com/masahide/go-yammer/cometd"
 	"github.com/masahide/go-yammer/schema"
 	"github.com/masahide/go-yammer/yammer"
@@ -265,8 +264,7 @@ func cc(group string, mes schema.Message, m mentions) error {
 		ccIDs = strings.Join(list.Users, ",")
 	}
 	postMes := &yammer.CreateMessageParams{Body: body, RepliedToId: mes.ThreadId, CC: ccIDs}
-	res, err := client.PostMessage(postMes)
-	pp.Print(res, err)
+	_, err := client.PostMessage(postMes)
 	return err
 }
 
