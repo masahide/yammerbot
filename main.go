@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/k0kubun/pp"
 	"github.com/kyokomi/go-docomo/docomo"
 	"github.com/masahide/go-yammer/cometd"
 	"github.com/masahide/go-yammer/schema"
@@ -32,6 +33,7 @@ var (
 	dClient  *docomo.Client
 	debug    bool
 	contexts = make(map[int]string)
+	current  *schema.User
 )
 
 // User is user struct
@@ -48,7 +50,6 @@ type MentionList struct {
 
 type cache struct {
 	AccessToken  string
-	UserID       int
 	DocomoAPIKey string
 	MentionLists map[string]MentionList
 }
@@ -99,11 +100,18 @@ func mainLoop() {
 		log.Println(err)
 		return
 	}
+	current, err = client.Current()
+	if err != nil {
+		log.Println(err)
+		return
+	}
 	inbox, err := client.InboxFeedV2()
 	if err != nil {
 		log.Println(err)
 		return
 	}
+	pp.Print(inbox)
+	os.Exit(0)
 
 	rt := cometd.New(realtime.RealtimeURI, realtime.AuthenticationToken)
 	err = rt.Handshake()
@@ -149,7 +157,7 @@ func receiveMessage(feed *schema.MessageFeed) {
 
 func analysis(mes schema.Message, refs []*schema.Reference) {
 	log.Printf("ThreadId:%d -> receiveMessage: \"%s\"", mes.ThreadId, mes.Body.Parsed)
-	m := getMentions(mes.Body.Parsed, refs)
+	m := getMentions(mes, refs)
 	if m.ToMe {
 		dispatcher(mes, m)
 	}
@@ -159,21 +167,27 @@ func analysis(mes schema.Message, refs []*schema.Reference) {
 type mentions struct {
 	Users []User
 	ToMe  bool
+	From  schema.Reference
 }
 
-func getUser(id int, refs []*schema.Reference) User {
-	user := User{ID: id}
+func getRef(id int, refs []*schema.Reference) schema.Reference {
 	for _, r := range refs {
 		if r.ID == id {
-			user.Name = r.FullName
+			return *r
 		}
 	}
-	return user
+	return schema.Reference{}
+}
+func getUser(ref schema.Reference) User {
+	return User{
+		ID:   ref.ID,
+		Name: ref.FullName,
+	}
 }
 
-func getMentions(mes string, refs []*schema.Reference) mentions {
+func getMentions(mes schema.Message, refs []*schema.Reference) mentions {
 	//m := mentionRe.FindAllString(mes, -1)
-	match := mentionRe.FindAllStringSubmatch(mes, -1)
+	match := mentionRe.FindAllStringSubmatch(mes.Body.Parsed, -1)
 	m := make([]int, 0, len(match))
 	for _, n := range match {
 		if len(n) >= 2 {
@@ -184,12 +198,13 @@ func getMentions(mes string, refs []*schema.Reference) mentions {
 	}
 	res := mentions{Users: make([]User, 0, len(m)), ToMe: false}
 	for _, u := range m {
-		if u == conf.UserID {
+		if u == current.ID {
 			res.ToMe = true
 		} else {
-			res.Users = append(res.Users, getUser(u, refs))
+			res.Users = append(res.Users, getUser(getRef(u, refs)))
 		}
 	}
+	res.From = getRef(mes.SenderId, refs)
 	return res
 }
 func dispatcher(mes schema.Message, m mentions) {
@@ -227,28 +242,26 @@ func getAcction(mes string) func(string, schema.Message, mentions) error {
 		return add
 	case strings.Contains(mes, "削除"):
 		return del
-	case strings.Contains(mes, "表示"):
+	case strings.Contains(mes, "表示"),
+		strings.Contains(mes, "メンバーは"):
 		return show
-	case strings.Contains(mes, "メンバーは"):
-		return show
-	case strings.Contains(mes, "メンション"):
-		return cc
-	case strings.Contains(mes, "めんしょん"):
-		return cc
-	case strings.Contains(mes, "ccして"):
-		return cc
-	case strings.Contains(mes, "CCして"):
+	case strings.Contains(mes, "メンション"),
+		strings.Contains(mes, "めんしょん"),
+		strings.Contains(mes, "ccして"),
+		strings.Contains(mes, "CCして"):
 		return cc
 	}
 	return zatu
 }
 func zatu(group string, mes schema.Message, m mentions) error {
 	message := strings.Replace(mes.Body.Plain, "\n", " ", -1)
+	message = strings.Replace(message, current.FullName, "", -1)
 	place := "東京"
 	charactor := 20
 	zatsu := docomo.DialogueRequest{
 		Utt:         &message,
 		Place:       &place,
+		Nickname:    &m.From.FirstName,
 		CharactorID: &charactor,
 	}
 	context, ok := contexts[mes.ThreadId]
