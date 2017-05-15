@@ -2,13 +2,16 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 
+	"github.com/kyokomi/go-docomo/docomo"
 	"github.com/masahide/go-yammer/cometd"
 	"github.com/masahide/go-yammer/schema"
 	"github.com/masahide/go-yammer/yammer"
@@ -21,20 +24,32 @@ const (
 var (
 	conf        cache
 	groupPrefix = byte('%')
-	mentionRe   = regexp.MustCompile(`\[\[user:[\d]+\]\]`)
-	tokenRe     = regexp.MustCompile(`\t+|\s+|"|,|\.|　+|\n+`)
-	client      *yammer.Client
+	//mentionRe   = regexp.MustCompile(`\[\[user:[\d]+\]\]`)
+	mentionRe = regexp.MustCompile(`\[\[user:([\d]+)\]\]`)
+
+	tokenRe  = regexp.MustCompile(`\t+|\s+|"|,|\.|　+|\n+`)
+	client   *yammer.Client
+	dClient  *docomo.Client
+	debug    bool
+	contexts = make(map[int]string)
 )
+
+// User is user struct
+type User struct {
+	Name string
+	ID   int
+}
 
 // MentionList is mention group
 type MentionList struct {
 	Name  string
-	Users []string
+	Users []User
 }
 
 type cache struct {
 	AccessToken  string
-	UserID       string
+	UserID       int
+	DocomoAPIKey string
 	MentionLists map[string]MentionList
 }
 
@@ -62,11 +77,23 @@ func saveCache(file string, config cache) error {
 	return ioutil.WriteFile(file, b, 0600)
 }
 
-func main() {
+func init() {
+	flag.BoolVar(&debug, "debug", debug, "debug mode")
+	flag.Parse()
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	conf = loadCache(configFile)
 	client = yammer.New(conf.AccessToken)
+	client.DebugMode = debug
+	dClient = docomo.NewClient(conf.DocomoAPIKey)
+}
 
+func main() {
+	for {
+		mainLoop()
+	}
+}
+
+func mainLoop() {
 	realtime, err := client.Realtime()
 	if err != nil {
 		log.Println(err)
@@ -87,14 +114,17 @@ func main() {
 
 	rt.SubscribeToFeed(inbox.ChannelID)
 	messageChan := make(chan *cometd.ConnectionResponse, 10)
-	//messageChan := make(chan *schema.MessageFeed, 10)
-	stopChan := make(chan bool, 1)
+	stopChan := make(chan bool)
 
 	log.Printf("Polling Realtime channelID: %v\n", inbox.ChannelID)
 	go rt.Poll(messageChan, stopChan)
 	for {
 		select {
-		case m := <-messageChan:
+		case m, ok := <-messageChan:
+			if !ok {
+				close(stopChan)
+				break
+			}
 			if m.Channel == "/meta/connect" {
 				continue
 			}
@@ -113,13 +143,13 @@ func main() {
 
 func receiveMessage(feed *schema.MessageFeed) {
 	for _, mes := range feed.Messages {
-		analysis(*mes)
+		analysis(*mes, feed.References)
 	}
 }
 
-func analysis(mes schema.Message) {
-	log.Println(mes.SenderId, mes.Body.Parsed)
-	m := getMentions(mes.Body.Parsed)
+func analysis(mes schema.Message, refs []*schema.Reference) {
+	log.Printf("ThreadId:%d -> receiveMessage: \"%s\"", mes.ThreadId, mes.Body.Parsed)
+	m := getMentions(mes.Body.Parsed, refs)
 	if m.ToMe {
 		dispatcher(mes, m)
 	}
@@ -127,18 +157,37 @@ func analysis(mes schema.Message) {
 }
 
 type mentions struct {
-	Users []string
+	Users []User
 	ToMe  bool
 }
 
-func getMentions(mes string) mentions {
-	m := mentionRe.FindAllString(mes, -1)
-	res := mentions{Users: make([]string, 0, len(m)), ToMe: false}
+func getUser(id int, refs []*schema.Reference) User {
+	user := User{ID: id}
+	for _, r := range refs {
+		if r.ID == id {
+			user.Name = r.FullName
+		}
+	}
+	return user
+}
+
+func getMentions(mes string, refs []*schema.Reference) mentions {
+	//m := mentionRe.FindAllString(mes, -1)
+	match := mentionRe.FindAllStringSubmatch(mes, -1)
+	m := make([]int, 0, len(match))
+	for _, n := range match {
+		if len(n) >= 2 {
+			if i, err := strconv.Atoi(n[1]); err == nil {
+				m = append(m, i)
+			}
+		}
+	}
+	res := mentions{Users: make([]User, 0, len(m)), ToMe: false}
 	for _, u := range m {
 		if u == conf.UserID {
 			res.ToMe = true
 		} else {
-			res.Users = append(res.Users, u)
+			res.Users = append(res.Users, getUser(u, refs))
 		}
 	}
 	return res
@@ -148,10 +197,13 @@ func dispatcher(mes schema.Message, m mentions) {
 	group := getGroup(tokens)
 	f := getAcction(mes.Body.Parsed)
 	if f == nil {
-		log.Printf("unknown: %s", mes.Body.Parsed)
+		log.Printf("ThreadId:%d -> unknown: %s", mes.ThreadId, mes.Body.Parsed)
 		return
 	}
-	f(group, mes, m)
+	err := f(group, mes, m)
+	if err != nil {
+		log.Printf("%v, err:%s", f, err)
+	}
 
 }
 
@@ -188,11 +240,35 @@ func getAcction(mes string) func(string, schema.Message, mentions) error {
 	case strings.Contains(mes, "CCして"):
 		return cc
 	}
-	return nil
+	return zatu
+}
+func zatu(group string, mes schema.Message, m mentions) error {
+	message := strings.Replace(mes.Body.Plain, "\n", " ", -1)
+	place := "東京"
+	charactor := 20
+	zatsu := docomo.DialogueRequest{
+		Utt:         &message,
+		Place:       &place,
+		CharactorID: &charactor,
+	}
+	context, ok := contexts[mes.ThreadId]
+	if ok {
+		zatsu.Context = &context
+	}
+	res, err := dClient.Dialogue.Get(zatsu, true)
+	if err != nil {
+		log.Printf("ThreadId:%d -> docomo.Dialogue err:%s, ThreadId:%d, message:'%s'", mes.ThreadId, err, mes.ThreadId, message)
+		return err
+	}
+	log.Printf("ThreadId:%d -> dococomo.Dialogue zatu: '%s'", mes.ThreadId, res.Utt)
+	postMes := &yammer.CreateMessageParams{Body: res.Utt, RepliedToId: mes.ThreadId}
+	_, err = client.PostMessage(postMes)
+	contexts[mes.ThreadId] = res.Context
+	return err
 }
 
 func add(group string, mes schema.Message, m mentions) error {
-	log.Printf("add mention group:%v, %v", group, m)
+	log.Printf("ThreadId:%d -> add mention group:%v, %v", mes.ThreadId, group, m)
 
 	var body string
 	list, ok := conf.MentionLists[group]
@@ -212,7 +288,7 @@ func add(group string, mes schema.Message, m mentions) error {
 	if err != nil {
 		body += fmt.Sprintf("メンバー更新に失敗しました.\nerr:%s", err)
 	} else {
-		body += fmt.Sprintf("%s のメンバーは\n %v に更新されました", group, list.Users)
+		body += fmt.Sprintf("%s のメンバーは\n %v に更新されました", group, userNameJoin(conf.MentionLists[group].Users))
 	}
 	postMes := &yammer.CreateMessageParams{Body: body, RepliedToId: mes.ThreadId}
 	_, err = client.PostMessage(postMes)
@@ -220,11 +296,11 @@ func add(group string, mes schema.Message, m mentions) error {
 }
 
 func del(group string, mes schema.Message, m mentions) error {
-	log.Printf("del mention group:%v, %v", group, m)
+	log.Printf("ThreadId:%d -> del mention group:%v, %v", mes.ThreadId, group, m)
 	var body string
 	list, ok := conf.MentionLists[group]
 	if !ok {
-		log.Printf("not exist group:%v, %v", group, m)
+		log.Printf("ThreadId:%d ->not exist group:%v, %v", mes.ThreadId, group, m)
 		body = fmt.Sprintf("%s は存在しません\n", group)
 	} else {
 		for _, u := range m.Users {
@@ -235,7 +311,7 @@ func del(group string, mes schema.Message, m mentions) error {
 		if err != nil {
 			body += fmt.Sprintf("メンバー更新に失敗しました.\nerr:%s", err)
 		} else {
-			body += fmt.Sprintf("%s のメンバーは\n %v に更新されました", group, list.Users)
+			body += fmt.Sprintf("%s のメンバーは\n %v に更新されました", group, userNameJoin(list.Users))
 		}
 	}
 	postMes := &yammer.CreateMessageParams{Body: body, RepliedToId: mes.ThreadId}
@@ -243,44 +319,70 @@ func del(group string, mes schema.Message, m mentions) error {
 	return err
 }
 func show(group string, mes schema.Message, m mentions) error {
-	log.Printf("show mention group:%v, %v", group, m)
+	log.Printf("ThreadId:%d -> show mention group:%v, %v", mes.ThreadId, group, m)
 	body := fmt.Sprintf("%s は存在しません", group)
 	list, ok := conf.MentionLists[group]
 	if ok {
-		body = fmt.Sprintf("%s のメンバーは\n %v です", group, list.Users)
+		body = fmt.Sprintf("%s のメンバーは\n %v です", group, userNameJoin(list.Users))
 	}
 	postMes := &yammer.CreateMessageParams{Body: body, RepliedToId: mes.ThreadId}
 	_, err := client.PostMessage(postMes)
 	return err
 }
 
+func idJoin(users []User) string {
+	s := make([]string, len(users))
+	for i := range users {
+		s[i] = fmt.Sprintf("%d", users[i].ID)
+	}
+	return strings.Join(s, ",")
+}
+func userJoin(users []User) string {
+	s := make([]string, len(users))
+	for i := range users {
+		s[i] = fmt.Sprintf("[[user:%d]]", users[i].ID)
+	}
+	return strings.Join(s, ",")
+}
+
+func userNameJoin(users []User) string {
+	s := make([]string, len(users))
+	for i := range users {
+		s[i] = users[i].Name
+	}
+	return strings.Join(s, ",")
+}
+
 func cc(group string, mes schema.Message, m mentions) error {
-	log.Printf("cc mention group:%v, %v", group, m)
-	var ccIDs string
+	log.Printf("ThreadId:%d -> cc mention group:%v, %v", mes.ThreadId, group, m)
+	var ccIDs, directToUserIDs string
 	body := fmt.Sprintf("%s は存在しません", group)
 	list, ok := conf.MentionLists[group]
 	if ok {
 		body = fmt.Sprintf("%s にccします", group)
-		ccIDs = strings.Join(list.Users, ",")
+		ccIDs = userJoin(list.Users)
+		if mes.DirectMessage {
+			directToUserIDs = idJoin(list.Users)
+		}
 	}
-	postMes := &yammer.CreateMessageParams{Body: body, RepliedToId: mes.ThreadId, CC: ccIDs}
+	postMes := &yammer.CreateMessageParams{Body: body, RepliedToId: mes.ThreadId, CC: ccIDs, DirectToUserIDs: directToUserIDs}
 	_, err := client.PostMessage(postMes)
 	return err
 }
 
-func deleteIfExists(slice []string, s string) []string {
-	res := make([]string, 0, len(slice))
+func deleteIfExists(slice []User, s User) []User {
+	res := make([]User, 0, len(slice))
 	for _, ele := range slice {
-		if ele == s {
+		if ele.ID == s.ID {
 			continue
 		}
 		res = append(res, ele)
 	}
 	return res
 }
-func appendIfMissing(slice []string, s string) []string {
+func appendIfMissing(slice []User, s User) []User {
 	for _, ele := range slice {
-		if ele == s {
+		if ele.ID == s.ID {
 			return slice
 		}
 	}
