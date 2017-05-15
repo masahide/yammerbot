@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/k0kubun/pp"
 	"github.com/kyokomi/go-docomo/docomo"
 	"github.com/masahide/go-yammer/cometd"
 	"github.com/masahide/go-yammer/schema"
@@ -26,7 +25,8 @@ var (
 	conf        cache
 	groupPrefix = byte('%')
 	//mentionRe   = regexp.MustCompile(`\[\[user:[\d]+\]\]`)
-	mentionRe = regexp.MustCompile(`\[\[user:([\d]+)\]\]`)
+	mentionRe   = regexp.MustCompile(`\[\[user:([\d]+)\]\]`)
+	ignoreMesRe = regexp.MustCompile(`cc: .*`)
 
 	tokenRe  = regexp.MustCompile(`\t+|\s+|"|,|\.|　+|\n+`)
 	client   *yammer.Client
@@ -110,8 +110,6 @@ func mainLoop() {
 		log.Println(err)
 		return
 	}
-	pp.Print(inbox)
-	os.Exit(0)
 
 	rt := cometd.New(realtime.RealtimeURI, realtime.AuthenticationToken)
 	err = rt.Handshake()
@@ -157,6 +155,7 @@ func receiveMessage(feed *schema.MessageFeed) {
 
 func analysis(mes schema.Message, refs []*schema.Reference) {
 	log.Printf("ThreadId:%d -> receiveMessage: \"%s\"", mes.ThreadId, mes.Body.Parsed)
+	mes.Body.Parsed = strings.Replace(mes.Body.Parsed, fmt.Sprintf("added [[user:%d]] to the conversation.", current.ID), "", -1)
 	m := getMentions(mes, refs)
 	if m.ToMe {
 		dispatcher(mes, m)
@@ -256,6 +255,11 @@ func getAcction(mes string) func(string, schema.Message, mentions) error {
 func zatu(group string, mes schema.Message, m mentions) error {
 	message := strings.Replace(mes.Body.Plain, "\n", " ", -1)
 	message = strings.Replace(message, current.FullName, "", -1)
+	message = ignoreMesRe.ReplaceAllString(message, "")
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return nil
+	}
 	place := "東京"
 	charactor := 20
 	zatsu := docomo.DialogueRequest{
