@@ -28,12 +28,14 @@ var (
 	mentionRe   = regexp.MustCompile(`\[\[user:([\d]+)\]\]`)
 	ignoreMesRe = regexp.MustCompile(`cc: .*`)
 
-	tokenRe  = regexp.MustCompile(`\t+|\s+|"|,|\.|　+|\n+`)
-	client   *yammer.Client
-	dClient  *docomo.Client
-	debug    bool
-	contexts = make(map[int]string)
-	current  *schema.User
+	tokenRe   = regexp.MustCompile(`\t+|\s+|"|,|\.|　+|\n+`)
+	client    *yammer.Client
+	dClient   *docomo.Client
+	debug     bool
+	contexts  = make(map[int]string)
+	current   *schema.User
+	place     = "東京"
+	charactor = 20
 )
 
 // User is user struct
@@ -128,8 +130,7 @@ func mainLoop() {
 		select {
 		case m, ok := <-messageChan:
 			if !ok {
-				close(stopChan)
-				break
+				return
 			}
 			if m.Channel == "/meta/connect" {
 				continue
@@ -260,8 +261,6 @@ func zatu(group string, mes schema.Message, m mentions) error {
 	if message == "" {
 		return nil
 	}
-	place := "東京"
-	charactor := 20
 	zatsu := docomo.DialogueRequest{
 		Utt:         &message,
 		Place:       &place,
