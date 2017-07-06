@@ -87,7 +87,9 @@ func init() {
 	conf = loadCache(configFile)
 	client = yammer.New(conf.AccessToken)
 	client.DebugMode = debug
-	dClient = docomo.NewClient(conf.DocomoAPIKey)
+	if conf.DocomoAPIKey != "" {
+		dClient = docomo.NewClient(conf.DocomoAPIKey)
+	}
 }
 
 func main() {
@@ -212,7 +214,7 @@ func dispatcher(mes schema.Message, m mentions) {
 	group := getGroup(tokens)
 	f := getAcction(mes.Body.Parsed)
 	if f == nil {
-		log.Printf("ThreadId:%d -> unknown: %s", mes.ThreadId, mes.Body.Parsed)
+		// log.Printf("ThreadId:%d -> unknown: %s", mes.ThreadId, mes.Body.Parsed)
 		return
 	}
 	err := f(group, mes, m)
@@ -250,8 +252,10 @@ func getAcction(mes string) func(string, schema.Message, mentions) error {
 		strings.Contains(mes, "ccして"),
 		strings.Contains(mes, "CCして"):
 		return cc
+	case dClient != nil:
+		return zatu
 	}
-	return zatu
+	return nil
 }
 func zatu(group string, mes schema.Message, m mentions) error {
 	message := strings.Replace(mes.Body.Plain, "\n", " ", -1)
